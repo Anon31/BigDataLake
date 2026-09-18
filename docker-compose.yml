@@ -25,5 +25,108 @@ services:
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: my-bucket
 
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.108.4
+    container_name: nessie
+    # le volume est créé root par compose; l'image tourne en uid 65534 -> on force root
+    user: "0:0"
+    ports:
+      - "19120:19120"
+    environment:
+      QUARKUS_HTTP_PORT: "19120"
+      NESSIE_VERSION_STORE_TYPE: ROCKSDB
+      NESSIE_VERSION_STORE_PERSIST_ROCKS_DATABASE_PATH: /var/lib/nessie/rocksdb
+      JAVA_OPTS_APPEND: "-Xms256m -Xmx768m"
+    mem_limit: 900m
+    volumes:
+      - nessie-data:/var/lib/nessie
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-master
+    depends_on:
+      - nessie
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: "7077"
+      SPARK_MASTER_WEBUI_PORT: "8080"
+      SPARK_DAEMON_MEMORY: 640m
+      SPARK_NO_DAEMONIZE: "1"
+    mem_limit: 900m
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MASTER: spark://spark-master:7077
+      SPARK_WORKER_WEBUI_PORT: "8081"
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: 1536m
+      SPARK_DAEMON_MEMORY: 640m
+      SPARK_NO_DAEMONIZE: "1"
+    mem_limit: 1792m
+    entrypoint: ["/opt/spark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.worker.Worker", "--webui-port", "8081", "spark://spark-master:7077"]
+    ports:
+      - "8081:8081"
+
+  minio-setup:
+    image: quay.io/minio/minio:latest
+    container_name: minio-setup
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh", "/scripts/setup-buckets.sh"]
+    volumes:
+      - ./scripts:/scripts
+    environment:
+      MC_HOST_local: http://minioadmin:minioadmin@minio:9000
+    restart: "no"
+
+  iceberg-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: iceberg-init
+    profiles: ["iceberg"]
+    depends_on:
+      - spark-master
+      - nessie
+      - minio
+      - minio-setup
+    volumes:
+      - ./scripts:/scripts
+    environment:
+      NESSIE_URI: http://nessie:19120/api/v2
+      ICEBERG_WAREHOUSE: s3://warehouse/
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_BUCKET: my-bucket
+      SPARK_MASTER: spark://spark-master:7077
+      PYSPARK_PYTHON: python3
+      PYSPARK_DRIVER_PYTHON: python3
+    command: ["/opt/spark/bin/spark-submit", "--master", "spark://spark-master:7077",
+              "--deploy-mode", "client",
+              "--conf", "spark.driver.memory=512m",
+              "--conf", "spark.executor.memory=768m",
+              "--conf", "spark.executor.cores=1",
+              "--conf", "spark.cores.max=2",
+              "--conf", "spark.sql.shuffle.partitions=2",
+              "/scripts/iceberg_init.py"]
+    mem_limit: 896m
+    restart: "no"
+
 volumes:
   minio-data:
+  nessie-data:
