@@ -127,6 +127,54 @@ services:
     mem_limit: 896m
     restart: "no"
 
+  docs:
+    image: ghcr.io/rockbenben/docsify-server:latest
+    container_name: docsify
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./docs:/docs
+    restart: unless-stopped
+
+  spark-sql-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-sql-server
+    depends_on:
+      - spark-master
+      - nessie
+      - minio
+      - minio-setup
+    ports:
+      - "9100:9100"
+    volumes:
+      - ./scripts:/scripts
+    environment:
+      NESSIE_URI: http://nessie:19120/api/v2
+      ICEBERG_WAREHOUSE: s3://warehouse/
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_REGION: us-east-1
+      S3_BUCKET: my-bucket
+      SPARK_MASTER: spark://spark-master:7077
+      SPARK_SQL_HOST: 0.0.0.0
+      SPARK_SQL_PORT: "9100"
+      SPARK_SQL_MAX_ROWS: "2000"
+      PYSPARK_PYTHON: python3
+      PYSPARK_DRIVER_PYTHON: python3
+    command: ["/opt/spark/bin/spark-submit", "--master", "spark://spark-master:7077",
+              "--deploy-mode", "client",
+              "--conf", "spark.driver.memory=512m",
+              "--conf", "spark.executor.memory=768m",
+              "--conf", "spark.executor.cores=1",
+              "--conf", "spark.cores.max=2",
+              "--conf", "spark.sql.shuffle.partitions=2",
+              "/scripts/spark_sql_server.py"]
+    mem_limit: 896m
+    restart: unless-stopped
+
 volumes:
   minio-data:
   nessie-data:

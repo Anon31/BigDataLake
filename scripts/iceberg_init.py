@@ -37,11 +37,11 @@ def build_spark():
         .appName("iceberg-init")
         .master(SPARK_MASTER)
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-        .config("spark.sql.catalog.nessie", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.nessie.catalog-impl", "org.apache.iceberg.nessie.NessieCatalog")
-        .config("spark.sql.catalog.nessie.uri", NESSIE_URI)
-        .config("spark.sql.catalog.nessie.ref", "main")
-        .config("spark.sql.catalog.nessie.warehouse", WAREHOUSE)
+        .config("spark.sql.catalog.iceberg", "org.apache.iceberg.spark.SparkCatalog")
+        .config("spark.sql.catalog.iceberg.catalog-impl", "org.apache.iceberg.nessie.NessieCatalog")
+        .config("spark.sql.catalog.iceberg.uri", NESSIE_URI)
+        .config("spark.sql.catalog.iceberg.ref", "main")
+        .config("spark.sql.catalog.iceberg.warehouse", WAREHOUSE)
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3.endpoint", S3_ENDPOINT)
@@ -60,18 +60,18 @@ def build_spark():
 
 
 def create_tables(spark):
-    spark.sql("CREATE DATABASE IF NOT EXISTS nessie.conversations")
+    spark.sql("CREATE DATABASE IF NOT EXISTS iceberg.opencode")
     for table, view, source in [
         ("parts", "src_parts", f"s3a://{BUCKET}/conversations/parts.parquet"),
         ("sessions", "src_sessions", f"s3a://{BUCKET}/conversations/sessions.parquet"),
     ]:
         spark.read.parquet(source).createOrReplaceTempView(view)
         spark.sql(
-            f"CREATE TABLE IF NOT EXISTS nessie.conversations.{table} "
+            f"CREATE TABLE IF NOT EXISTS iceberg.opencode.{table} "
             f"USING iceberg AS SELECT * FROM {view}"
         )
-        count = spark.sql(f"SELECT count(*) AS n FROM nessie.conversations.{table}").first()["n"]
-        print(f"[iceberg-init] table nessie.conversations.{table} prête : {count} lignes")
+        count = spark.sql(f"SELECT count(*) AS n FROM iceberg.opencode.{table}").first()["n"]
+        print(f"[iceberg-init] table iceberg.opencode.{table} prête : {count} lignes")
 
 
 def main():
@@ -79,11 +79,11 @@ def main():
     spark = build_spark()
     try:
         create_tables(spark)
-        print("\n=== Tables Iceberg (catalogue nessie) ===")
-        spark.sql("SHOW TABLES IN nessie.conversations").show(truncate=False)
+        print("\n=== Tables Iceberg (catalogue iceberg) ===")
+        spark.sql("SHOW TABLES IN iceberg.opencode").show(truncate=False)
         print("=== Snapshots (parts) ===")
         spark.sql("SELECT snapshot_id, committed_at, operation, summary "
-                  "FROM nessie.conversations.parts.system.snapshots").show(truncate=False)
+                  "FROM iceberg.opencode.parts.system.snapshots").show(truncate=False)
         print("[iceberg-init] terminé ✔")
     finally:
         spark.stop()

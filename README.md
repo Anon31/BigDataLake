@@ -12,10 +12,24 @@ classiques d'une architecture Big Data :
 | **SQL local** | DuckDB | Reads/agrégations rapides directement sur S3 |
 | **Visualisation** | Streamlit + Altair | Dashboard web avec onglets |
 | **Ingestion** | Scripts Python + plugin OpenCode | Export automatique des données en parquet |
+| **Documentation** | docsify | Site web de doc (port 3000) servi par Docker |
 
 > Le but pédagogique est de reproduire un flux complet : **source (agent IA) →
 > objets (MinIO) → requêtes (DuckDB) → visuels (Streamlit) → table transactionnelle
 > (Iceberg via Spark + Nessie)**, le tout en docker-compose.
+
+---
+
+## 📖 Documentation
+
+Une **documentation web (docsify)** est embarquée dans le projet :
+
+```bash
+docker compose up -d docs     # puis ouvrir http://localhost:3000
+```
+
+Les sources Markdown sont dans [`docs/`](docs/) (architecture, installation,
+ingestion, dashboard, Iceberg, dépannage, glossaire, journal, roadmap).
 
 ---
 
@@ -53,6 +67,7 @@ classiques d'une architecture Big Data :
 | `nessie` | ghcr.io/projectnessie/nessie:0.108.4 | 19120 | Catalogue git-like (store RocksDB persistant) |
 | `spark-master` | build local (`Dockerfile.spark`) | 7077 (RPC), 8080 (UI) | Master standalone |
 | `spark-worker` | build local (`Dockerfile.spark`) | 8081 (UI) | Worker standalone |
+| `spark-sql-server` | build local (`Dockerfile.spark`) | 9100 (HTTP) | API SQL : SparkSession persistante (catalogue `iceberg`) pour l'onglet Streamlit |
 | `minio-setup` | quay.io/minio/minio | — (one-shot) | Crée les buckets `my-bucket` et `warehouse` |
 | `iceberg-init` | build local (`Dockerfile.spark`) | — (job, profil `iceberg`) | Crée les tables Iceberg depuis les parquet |
 
@@ -85,12 +100,13 @@ BigDataLake/
 ├── Dockerfile                # image Streamlit (python:3.11-slim + streamlit/duckdb/requests)
 ├── Dockerfile.spark          # image Spark 3.5.4 + jars Iceberg 1.5.0 + hadoop-aws
 ├── requirements.txt          # streamlit, duckdb, requests
-├── app.py                    # dashboard Streamlit (6 onglets)
+├── app.py                    # dashboard Streamlit (7 onglets)
 ├── scripts/
 │   ├── log_to_parquet.py     # opencode.log → s3://my-bucket/opencode-logs.parquet
 │   ├── db_to_parquet.py      # opencode.db  → s3://my-bucket/conversations/{parts,sessions}.parquet
 │   ├── setup-buckets.sh      # création des buckets (one-shot)
-│   └── iceberg_init.py       # job PySpark : parquet → tables Iceberg (catalogue nessie)
+│   ├── iceberg_init.py       # job PySpark : parquet → tables Iceberg (catalogue nessie→iceberg)
+│   └── spark_sql_server.py   # API HTTP : SparkSession persistante → requêtes SQL (onglet Spark/Iceberg)
 └── .opencode/plugin/
     └── export-to-s3.ts       # export automatique à chaque session OpenCode terminée
 ```
@@ -173,6 +189,8 @@ Ouvrir **http://localhost:8501**. Le dashboard proposé par `app.py` :
 4. **Fichiers modifies** — les fichiers touchés par l'agent (patchs) par session.
 5. **Sessions** — tableau de bord par session (nombre de parts, d'outils, tokens, coût).
 6. **SQL explorer** — requête libre DuckDB sur les tables `parts`, `sessions`, `logs`.
+7. **Spark SQL / Iceberg** — requête SQL libre exécutée par le cluster Spark sur
+   les tables Iceberg (`iceberg.opencode.parts`, `iceberg.opencode.sessions`).
 
 ### Étape 5 — Export automatique (plugin OpenCode)
 
@@ -190,8 +208,9 @@ d'OpenCode, soit copier ces scripts et le plugin dans son propre espace.)
 
 ### Étape 6 — Apache Iceberg (Spark + Nessie)
 
-Les tables `conversations.parts` et `conversations.sessions` sont créées dans le
-catalogue Nessie en lisant les parquet du bucket `my-bucket` :
+Les tables `opencode.parts` et `opencode.sessions` sont créées dans le
+catalogue Nessie (enregistré sous le nom **`iceberg`** dans Spark) en lisant les
+parquet du bucket `my-bucket` :
 
 ```bash
 docker compose run --rm iceberg-init
@@ -199,22 +218,22 @@ docker compose run --rm iceberg-init
 
 Ce job PySpark (mode client, master `spark://spark-master:7077`) :
 1. attend que Nessie soit prêt (`GET /api/v2/config`) ;
-2. crée le namespace `nessie.conversations` ; 
+2. crée le namespace `iceberg.opencode` ;
 3. lit `s3a://my-bucket/conversations/*.parquet` (S3A) ;
-4. exécute `CREATE TABLE IF NOT EXISTS nessie.conversations.parts USING iceberg AS SELECT ...`
+4. exécute `CREATE TABLE IF NOT EXISTS iceberg.opencode.parts USING iceberg AS SELECT ...`
    → idempotent (ne fait rien si la table existe) ;
 5. affiche les tables et les **snapshots** Iceberg.
 
 Résultat attendu (sur les données du TP) :
-- `nessie.conversations.parts` → **732 lignes**
-- `nessie.conversations.sessions` → **6 lignes**
+- `iceberg.opencode.parts` → **732 lignes**
+- `iceberg.opencode.sessions` → **6 lignes**
 
 Vérifications :
 
 ```bash
 # catalogue Nessie
 curl -s "http://localhost:19120/api/v2/trees/main/entries?max-records=25" | python3 -m json.tool
-#    → 3 entries : NAMESPACE conversations, ICEBERG_TABLE parts, ICEBERG_TABLE sessions
+#    → 3 entries : NAMESPACE opencode, ICEBERG_TABLE parts, ICEBERG_TABLE sessions
 
 # warehouse (fichiers Iceberg : data + metadata.json + snapshots avro)
 docker exec minio-s3 mc ls -r local/warehouse
@@ -223,12 +242,37 @@ docker exec minio-s3 mc ls -r local/warehouse
 Exploration Spark SQL (une table Iceberg dans Nessie, branche `main`) :
 
 ```sql
-SHOW TABLES IN nessie.conversations;
-SELECT count(*) FROM nessie.conversations.parts;
-SELECT part_type, count(*) FROM nessie.conversations.parts GROUP BY 1 ORDER BY 2 DESC;
-SELECT * FROM nessie.conversations.parts.system.snapshots;
+SHOW TABLES IN iceberg.opencode;
+SELECT count(*) FROM iceberg.opencode.parts;
+SELECT part_type, count(*) FROM iceberg.opencode.parts GROUP BY 1 ORDER BY 2 DESC;
+SELECT * FROM iceberg.opencode.parts.system.snapshots;
 -- branches git-like Nessie :
---   CALL nessie.system.create_branch('exp', 'main');  (nécessite l'extension Nessie Spark)
+--   CALL iceberg.system.create_branch('exp', 'main');  (nécessite l'extension Nessie Spark)
+```
+
+### Étape 7 — Requêtes Spark SQL depuis le dashboard (onglet « Spark SQL / Iceberg »)
+
+Un service `spark-sql-server` garde une SparkSession persistante (catalogue
+`iceberg`) et expose une API HTTP sur le port **9100**. L'onglet « Spark SQL /
+Iceberg » de Streamlit soumet des requêtes SQL libres, exécutées par le
+cluster Spark sur les tables Iceberg :
+
+```bash
+docker compose up -d spark-sql-server     # démarre l'API (~30 s de démarrage)
+
+# test unitaire de l'API :
+curl -s http://localhost:9100/health
+curl -s -X POST http://localhost:9100/query -H "Content-Type: application/json" \
+     -d '{"sql": "SELECT * FROM iceberg.opencode.parts LIMIT 5"}'
+```
+
+Dans Streamlit, on peut alors taper par exemple :
+
+```sql
+SELECT * FROM iceberg.opencode.parts LIMIT 20
+SELECT part_type, count(*) AS n FROM iceberg.opencode.parts GROUP BY 1 ORDER BY 2 DESC
+SELECT * FROM iceberg.opencode.parts.system.snapshots
+SHOW TABLES IN iceberg.opencode
 ```
 
 ---
@@ -299,6 +343,18 @@ SELECT * FROM nessie.conversations.parts.system.snapshots;
    pour master/worker, `spark.driver.memory=512m` (Spark refuse < 450 Mo),
    executor 768m / 1 core. Recommandation : **8 Go** de RAM à la maison.
 
+10. **Requêtes SQL sur Iceberg depuis Streamlit (onglet « Spark SQL / Iceberg »)** :
+    - le catalogue Spark est enregistré sous le nom **`iceberg`** (base **`opencode`**,
+      tables `parts`/`sessions`) — le nommage interne Nessie reste inchangé ;
+    - `scripts/spark_sql_server.py` : mini API HTTP (stdlib `http.server`) qui garde
+      une SparkSession persistante (catalogue `iceberg`, même config S3A que
+      `iceberg_init.py`), expose `GET /health` (liste les tables) et
+      `POST /query` (exécute le SQL, renvoie colonnes + lignes, cap 2000 rows) ;
+    - service `spark-sql-server` (même `Dockerfile.spark`, port **9100**, `restart:
+      unless-stopped`) ; l'onglet Streamlit fait un simple `requests.post` ;
+    - détail honnête : `rows_affected` est calculé par un `df.count()` (action Spark
+      supplémentaire) ; la première requête est lente (~30 s de démarrage du driver).
+
 ---
 
 ## 6. Commandes utiles
@@ -308,6 +364,12 @@ docker compose up -d --build           # démarrer / reconstruire toute la stack
 docker compose logs -f streamlit       # logs de l'app
 docker compose ps                      # état des services
 docker compose run --rm iceberg-init   # (re)créer les tables Iceberg (idempotent)
+docker compose up -d spark-sql-server  # API SQL Spark (onglet Iceberg du dashboard)
+
+# Spark SQL (API du spark-sql-server, port 9100)
+curl -s http://localhost:9100/health
+curl -s -X POST http://localhost:9100/query -H "Content-Type: application/json" \
+     -d '{"sql": "SELECT count(*) AS n FROM iceberg.opencode.parts"}'
 
 # données
 python3.10 scripts/log_to_parquet.py
@@ -334,6 +396,7 @@ docker compose down -v                 # supprime aussi les volumes (reset compl
 | 7077 | Spark master RPC | — |
 | 8080 | Spark master UI | http://localhost:8080 |
 | 8081 | Spark worker UI | http://localhost:8081 |
+| 9100 | Spark SQL API | http://localhost:9100/health |
 
 ---
 
@@ -368,8 +431,8 @@ docker compose down -v                 # supprime aussi les volumes (reset compl
 
 ## 8. Pistes d'extension
 
-- Branches / tags Nessie : `CALL nessie.system.create_branch('experiment', 'main')`
-  puis lecture `??nessie...` — ou l'extension `nessie-spark-extensions`.
+- Branches / tags Nessie : `CALL iceberg.system.create_branch('experiment', 'main')`
+  puis lecture `??iceberg...` — ou l'extension `nessie-spark-extensions`.
 - `iceberg-init` enrichi pour d'autres formats (données en silo, partitionnement
   Iceberg par date (`PARTITIONED BY (year(dt))`)).
 - Déplacer l'export des logs vers le pipeline Iceberg (table `logs`).

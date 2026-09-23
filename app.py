@@ -18,6 +18,7 @@ S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
 S3_BUCKET = os.getenv("S3_BUCKET", "my-bucket")
 S3_REGION = os.getenv("S3_REGION", "us-east-1")
+SPARK_SQL_URL = os.getenv("SPARK_SQL_URL", "http://spark-sql-server:9100")
 
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
@@ -128,6 +129,22 @@ def parse_tool_input(raw):
         return str(raw)
 
 
+def spark_health():
+    try:
+        resp = requests.get(f"{SPARK_SQL_URL}/health", timeout=10)
+        return resp.status_code == 200, resp.json()
+    except Exception as e:
+        return False, str(e)
+
+
+def run_spark_query(sql):
+    resp = requests.post(f"{SPARK_SQL_URL}/query", json={"sql": sql}, timeout=180)
+    payload = resp.json()
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("error", "Erreur inconnue du serveur Spark SQL"))
+    return payload
+
+
 st.set_page_config(page_title="Big Data Lake - Agent Visualizer", layout="wide")
 st.title("Big Data Lake - Agent Visualizer")
 
@@ -181,7 +198,9 @@ if has_conv:
     tab_labels += ["Timeline", "Agent actions", "Fichiers modifies", "Sessions", "SQL explorer"]
 else:
     tab_labels += ["Conversations (export manquant)"]
+tab_labels += ["Spark SQL / Iceberg"]
 
+tab_count = len(tab_labels)
 tabs = st.tabs(tab_labels)
 
 # ----------------------------------------------------------------------
@@ -525,3 +544,50 @@ else:
         "Les données de conversation ne sont pas disponibles. Lancez "
         "`python3.10 scripts/db_to_parquet.py` puis rafraichissez la page."
     )
+
+# ----------------------------------------------------------------------
+# Onglet : Spark SQL / Iceberg (cluster Spark + catalogue Nessie)
+# ----------------------------------------------------------------------
+with tabs[tab_count - 1]:
+    st.subheader("Explorateur SQL Spark / Iceberg")
+
+    status, info = spark_health()
+    if status:
+        st.success(f"Serveur Spark SQL joignable : {SPARK_SQL_URL}")
+        tables = info.get("tables") or []
+        if tables:
+            st.caption("Tables Iceberg disponibles : " + ", ".join(f"`iceberg.opencode.{t}`" for t in tables))
+        else:
+            st.caption(
+                "Catalogue `iceberg`, base `opencode`, tables `parts`/`sessions`. "
+                "Aucune table trouvee : lancez `docker compose run --rm iceberg-init`."
+            )
+    else:
+        st.error(f"Serveur Spark SQL injoignable ({SPARK_SQL_URL}) : {info}")
+        st.caption("Lancez `docker compose up -d spark-sql-server` - le premier demarrage prend ~30s.")
+
+    st.markdown(
+        "Exemples :\n"
+        "- `SELECT * FROM iceberg.opencode.parts LIMIT 20`\n"
+        "- `SELECT part_type, count(*) AS n FROM iceberg.opencode.parts GROUP BY 1 ORDER BY 2 DESC`\n"
+        "- `SELECT * FROM iceberg.opencode.parts.system.snapshots`\n"
+        "- `SHOW TABLES IN iceberg.opencode`"
+    )
+    spark_sql = st.text_area(
+        "Requete SQL (Spark / Iceberg):",
+        value="SELECT * FROM iceberg.opencode.parts LIMIT 20",
+        height=120, key="spark_sql_query"
+    )
+    if st.button("Executer sur Spark", key="spark_sql_run"):
+        with st.spinner("Spark execute la requete..."):
+            try:
+                res = run_spark_query(spark_sql)
+                c1, c2 = st.columns(2)
+                c1.metric("Lignes renvoyees", res["count"])
+                c2.metric("Duree", f"{res['elapsed_ms'] / 1000:.1f} s")
+                if res["rows"]:
+                    st.dataframe(pd.DataFrame(res["rows"], columns=res["columns"]), width="stretch")
+                else:
+                    st.success(f"Requete executee ({res['rows_affected']} ligne(s) affectee(s), aucune ligne renvoyee).")
+            except Exception as e:
+                st.error(f"Erreur Spark SQL: {e}")
